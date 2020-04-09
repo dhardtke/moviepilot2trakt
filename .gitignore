@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# User Data
+data/config.ini
+data/imdb_cache.json
+data/config.ini
+data/imdb_cache.json
