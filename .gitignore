@@ -132,3 +132,4 @@ dmypy.json
 data/config.ini
 data/imdb_cache.json
 !data
+.idea/sonarlint/
