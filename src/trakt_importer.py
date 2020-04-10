@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 from json import load, dump, dumps, decoder
 
 import requests
@@ -10,6 +11,7 @@ CACHE_FILE = "imdb_cache.json"
 class TraktImporter:
     ia = IMDb()
     cache = dict()
+    transform_keys = {"movies": "movies", "series": "shows"}  # a mapping of moviepilot.de keys => trakt.tv keys
 
     def __init__(self, config: dict, moviepilot_lists: dict, debug: bool):
         self.debug = debug
@@ -66,14 +68,12 @@ class TraktImporter:
         return stats
 
     @staticmethod
-    def __update_stats(stats: dict, result: dict, include_not_found=False) -> None:
+    def __update_stats(stats: dict, result: dict) -> None:
         for key in stats:
-            if key == "not_found" and not include_not_found:
-                continue
             for what in stats[key]:
                 if key not in result or what not in result[key]:
                     continue
-                if key == "not_found":
+                if type(result[key][what]) == list:
                     stats[key][what] += len(result[key][what])
                 else:
                     stats[key][what] += result[key][what]
@@ -92,45 +92,62 @@ class TraktImporter:
 
     def __process(self, description: str, moviepilot_select: str, endpoint: str, date_key: str = None):
         data = {"movies": [], "shows": []}
-        transform_keys = {"movies": "movies", "series": "shows"}  # a mapping of moviepilot.de keys => trakt.tv keys
-        for moviepilot_key in transform_keys.keys():
+        processed = {"movies": {}, "shows": {}}
+        for moviepilot_key in TraktImporter.transform_keys.keys():
+            trakt_key = TraktImporter.transform_keys[moviepilot_key]
             for moviepilot_entry in self.moviepilot_lists[moviepilot_select][moviepilot_key]:
                 trakt_entry = {
-                    "title": moviepilot_entry["title"]
+                    "title": moviepilot_entry["title"],
+                    "ids": {
+                        "imdb": TraktImporter.__find_imdb_id(moviepilot_entry["title"])
+                    }
                 }
                 if date_key is not None:
                     trakt_entry[date_key] = moviepilot_entry["date"].isoformat()
-                data[transform_keys[moviepilot_key]].append(trakt_entry)
+                processed[trakt_key][trakt_entry["title"]] = trakt_entry
+                data[trakt_key].append(trakt_entry)
 
         stats = TraktImporter.__init_stats()
-        # first attempt by title
         result = self.__request("post", endpoint, data)
         TraktImporter.__update_stats(stats, result)
-        if len(result["not_found"]["movies"]) > 0 or len(result["not_found"]["shows"]) > 0:
-            data = {"movies": [], "shows": []}
-            for key in data.keys():
-                for entry in result["not_found"][key]:
-                    trakt_entry = {
-                        "title": entry["title"],
-                        "ids": {
-                            "imdb": TraktImporter.__find_imdb_id(entry["title"])
-                        }
-                    }
-                    if date_key is not None:
-                        trakt_entry[date_key] = entry[date_key].isoformat()
-                    data[key].append(trakt_entry)
-            result = self.__request("post", endpoint, data)
-            TraktImporter.__update_stats(stats, result, True)
         print("[INFO] [Trakt] {} completed: {}".format(description, stats))
         if len(result["not_found"]["movies"]) > 0 or len(result["not_found"]["shows"]) > 0:
             print("[WARN] [Trakt] {} could not find the following items on trakt.tv: {}".format(description, result["not_found"]))
             print("[WARN] [Trakt] Try to add them manually to your watchlist.")
 
+        for key in processed.keys():
+            processed[key] = list(processed[key].values())
+        return processed
+
     def add_to_watchlist(self):
         self.__process("Watchlist Import", "watchlisted", "sync/watchlist")
 
     def add_to_history(self):
-        self.__process("Rated List (History)", "rated", "sync/history")
+        found = self.__process("Rated List (History)", "rated", "sync/history")
+
+        def __find_moviepilot_entry(title, select):
+            for entry in self.moviepilot_lists["rated"][select]:
+                if entry["title"] == title:
+                    return entry
+            return None
+
+        for moviepilot_key in TraktImporter.transform_keys:
+            trakt_key = TraktImporter.transform_keys[moviepilot_key]
+            for item in found[trakt_key]:
+                moviepilot_entry = __find_moviepilot_entry(item["title"], moviepilot_key)
+                item["rating"] = int(moviepilot_entry["rating"] + 0.5)
+                item["rated_at"] = moviepilot_entry["date"].isoformat()
+
+        stats = TraktImporter.__init_stats()
+        # upload in chunks of 10 movies / 10 shows as the API would otherwise be busy for too long
+        cur = deepcopy(found)
+        while len(cur["movies"]) > 0 or len(cur["shows"]) > 0:
+            data = {"movies": cur["movies"][:10], "shows": cur["shows"][:10]}
+            del cur["movies"][:10]
+            del cur["shows"][:10]
+            result = self.__request("post", "sync/ratings", data)
+            TraktImporter.__update_stats(stats, result)
+        print("[INFO] [Trakt] Rated List (History): Ratings import completed: {}".format(stats))
 
     def work(self):
         # self.add_to_watchlist()
